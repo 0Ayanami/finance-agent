@@ -1,0 +1,219 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: etcd-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd
+spec:
+  selector:
+    app: etcd
+  ports:
+    - port: 2379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: etcd
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: etcd
+  template:
+    metadata:
+      labels:
+        app: etcd
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: etcd
+          image: quay.io/coreos/etcd:v3.5.25
+          command: ["etcd"]
+          args: ["--listen-client-urls=http://0.0.0.0:2379", "--advertise-client-urls=http://etcd:2379", "--data-dir=/etcd", "--auto-compaction-mode=revision", "--auto-compaction-retention=1000"]
+          readinessProbe:
+            exec:
+              command: ["etcdctl", "endpoint", "health"]
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {memory: 768Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: data
+              mountPath: /etcd
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: etcd-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+spec:
+  selector:
+    app: minio
+  ports:
+    - port: 9000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: minio
+          image: milvusdb/minio:RELEASE.2024-12-18T13-15-44Z
+          args: ["server", "/data"]
+          envFrom:
+            - secretRef:
+                name: milvus-storage
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+          resources:
+            requests: {cpu: 150m, memory: 256Mi}
+            limits: {memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: minio-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: milvus-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: milvus
+spec:
+  selector:
+    app: milvus
+  ports:
+    - port: 19530
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: milvus
+  template:
+    metadata:
+      labels:
+        app: milvus
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        runAsNonRoot: true
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: milvus
+          image: milvusdb/milvus:v3.0.5
+          command: ["milvus", "run", "standalone"]
+          env:
+            - name: ETCD_ENDPOINTS
+              value: etcd:2379
+            - name: MINIO_ADDRESS
+              value: minio:9000
+            - name: MINIO_REGION
+              value: us-east-1
+          envFrom:
+            - secretRef:
+                name: milvus-storage
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 9091
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9091
+          resources:
+            requests: {cpu: 500m, memory: 2Gi}
+            limits: {memory: 5Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/milvus
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: milvus-data

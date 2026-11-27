@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ayanami
+resources:
+  - namespace.yaml
+  - app.yaml
+  - services.yaml
+  - milvus.yaml
+  - network.yaml
+  - tracing.yaml
+configMapGenerator:
+  - name: otel-collector
+    files: [config.yaml=otel-collector.yaml]
+  - name: jaeger
+    files: [config.yaml=jaeger.yaml]

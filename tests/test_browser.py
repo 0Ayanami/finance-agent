@@ -1,0 +1,355 @@
+"""Optional real-browser check against the full HTTP application and worker stack."""
+
+import os
+import socket
+import threading
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import uvicorn
+from agent_harness import HarnessConfig
+from agent_harness.infrastructure.session_cache import HISTORY_PAGE_SIZE
+from agent_harness.interfaces.web.app import create_app
+from agent_harness.interfaces.web.host import frontend_directory
+from test_services import response, text, tool, wait_until
+
+
+def test_browser_chat_approval_reload_and_responsive_layout(tmp_path):
+    browser_api = pytest.importorskip("playwright.sync_api")
+    executable = os.getenv(
+        "HARNESS_BROWSER_EXECUTABLE",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    )
+    if not Path(executable).exists():
+        pytest.skip("Set HARNESS_BROWSER_EXECUTABLE to an installed Chromium browser")
+
+    send_second = threading.Event()
+    finish_reply = threading.Event()
+
+    class BrowserModel:
+        def __init__(self):
+            self.messages = SimpleNamespace(create=self.create, stream=self.stream)
+
+        @contextmanager
+        def stream(self, **arguments):
+            reply = self.create(**arguments)
+
+            def events():
+                if reply.stop_reason == "end_turn":
+                    yield chunk("验证完成。")
+                    assert send_second.wait(15), "Browser did not render the first partial reply"
+                    yield chunk("命令输出为 browser-ready，")
+                    assert finish_reply.wait(15), "Browser did not render the second partial reply"
+                    yield chunk("任务已经保存在当前会话。")
+                yield SimpleNamespace(type="message_stop")
+
+            yield BrowserStream(events(), reply)
+
+        def create(self, **arguments):
+            if arguments["max_tokens"] == 1000:
+                return response(text("[]"))
+            if isinstance(arguments["messages"][-1]["content"], list):
+                return response(
+                    text("验证完成。命令输出为 browser-ready，任务已经保存在当前会话。")
+                )
+            return response(
+                tool("create_task", {"subject": "网页联调验证"}, "create-1"),
+                tool("bash", {"command": "echo browser-ready"}, "bash-1"),
+                stop_reason="tool_use",
+            )
+
+    class BrowserStream:
+        def __init__(self, events, reply):
+            self.events = events
+            self.reply = reply
+
+        def __iter__(self):
+            return self.events
+
+        def get_final_message(self):
+            return self.reply
+
+    def chunk(value):
+        return SimpleNamespace(type="content_block_delta", index=0,
+                               delta=SimpleNamespace(type="text_delta", text=value))
+
+    output = frontend_directory() / "out"
+    assert (output / "zh" / "index.html").exists(), (
+        "Build the migrated frontend before running browser tests"
+    )
+    memory_dir = tmp_path / ".memory"
+    memory_dir.mkdir()
+    (memory_dir / "MEMORY.md").write_text("- Browser test memory\n", encoding="utf-8")
+    skills_dir = tmp_path / "skills"
+    flat_skill = skills_dir / "browser-skill"
+    flat_skill.mkdir(parents=True)
+    (flat_skill / "SKILL.md").write_text("# Browser skill\n", encoding="utf-8")
+    nested_skill = skills_dir / "tooling" / "review-skill"
+    nested_skill.mkdir(parents=True)
+    unsafe_markup = '<img src="/external-skill-resource" onerror="alert(1)">'
+    (nested_skill / "SKILL.md").write_text(f"# Review skill\n\n{unsafe_markup}\n", encoding="utf-8")
+    app = create_app(
+        HarnessConfig(tmp_path, "browser-test-model"), BrowserModel, frontend_directory=output
+    )
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(app, log_level="error", timeout_graceful_shutdown=1))
+    thread = threading.Thread(target=lambda: server.run(sockets=[listener]), daemon=True)
+    thread.start()
+    wait_until(lambda: server.started, timeout=10)
+    artifacts = Path(__file__).parents[1] / ".artifacts" / "test-results" / "browser"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    errors = []
+    try:
+        with browser_api.sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=executable, headless=True)
+            page = browser.new_page(
+                viewport={"width": 1440, "height": 950},
+                device_scale_factor=1,
+                base_url=f"http://127.0.0.1:{port}",
+            )
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(f"http://127.0.0.1:{port}")
+            browser_api.expect(page.locator("#connection")).to_have_text("本地服务已连接")
+            browser_api.expect(page.locator("h1")).to_be_visible()
+            browser_api.expect(page).to_have_title("AYANAMI")
+            header = page.get_by_role("banner")
+            brand = header.get_by_role("link", name="AYANAMI", exact=True)
+            repository = header.get_by_role("link", name="GitHub", exact=True)
+            repository_url = "https://github.com/0Ayanami/agent-harness"
+            browser_api.expect(brand).to_be_visible()
+            browser_api.expect(repository).to_have_attribute("href", repository_url)
+            teaching_links = header.locator(
+                'a[href$="/timeline"], a[href$="/compare"], a[href$="/layers"]'
+            )
+            browser_api.expect(teaching_links).to_have_count(0)
+            skills = page.get_by_test_id("skill-menu")
+            summary = skills.locator("summary")
+            browser_api.expect(summary).to_have_text("技能（Skills）")
+            browser_api.expect(skills).not_to_have_attribute("open", "")
+            summary.click()
+            groups = skills.get_by_test_id("skill-category")
+            browser_api.expect(
+                groups.filter(has_text="项目技能").get_by_role("button", name="browser-skill")
+            ).to_be_visible()
+            groups.filter(has_text="tooling").get_by_role("button", name="review-skill").click()
+            viewer = page.get_by_test_id("skill-viewer")
+            browser_api.expect(viewer.get_by_test_id("skill-markdown")).to_contain_text(
+                unsafe_markup
+            )
+            browser_api.expect(viewer.locator("img, script, a")).to_have_count(0)
+            page.keyboard.press("Escape")
+            browser_api.expect(viewer).to_have_count(0)
+            header.get_by_test_id("library-nav").click()
+            browser_api.expect(page).to_have_url(f"http://127.0.0.1:{port}/zh/library/")
+            brand.click()
+            browser_api.expect(page.locator("#connection")).to_have_text("本地服务已连接")
+            page.screenshot(path=str(artifacts / "web-desktop.png"), full_page=True)
+            page.locator("#message").fill("运行网页联调")
+            page.locator("#send").click()
+            browser_api.expect(page.locator(".approval")).to_be_visible()
+            page.reload()
+            browser_api.expect(page.locator(".approval")).to_be_visible()
+            page.get_by_role("button", name="允许执行").click()
+            assistant = page.locator(".message.assistant .body")
+            browser_api.expect(assistant).to_have_text("验证完成。")
+            sid = page.evaluate("localStorage.getItem('harness.session')")
+            session_repository = app.state.application.repository
+            assert not any(event["kind"] == "assistant" for event in session_repository.events(sid))
+            send_second.set()
+            browser_api.expect(assistant).to_have_text("验证完成。命令输出为 browser-ready，")
+            page.reload()
+            browser_api.expect(assistant).to_have_text("验证完成。命令输出为 browser-ready，")
+            finish_reply.set()
+            browser_api.expect(assistant).to_have_text(
+                "验证完成。命令输出为 browser-ready，任务已经保存在当前会话。")
+            browser_api.expect(assistant).to_have_count(1)
+            browser_api.expect(page.locator("#runtime-status")).to_have_text("准备就绪")
+            browser_api.expect(page.locator("#tasks")).to_contain_text("网页联调验证")
+            browser_api.expect(page.locator("#tool-count")).to_have_text("2")
+            page.screenshot(path=str(artifacts / "web-conversation.png"), full_page=True)
+            page.reload()
+            browser_api.expect(page.locator(".message.assistant .body")).to_contain_text(
+                "browser-ready"
+            )
+            page.set_viewport_size({"width": 390, "height": 844})
+            browser_api.expect(page.locator("#composer")).to_be_visible()
+            browser_api.expect(page.get_by_test_id("skill-menu")).to_be_visible()
+            assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+            mobile_menu = header.get_by_role("button", name="切换导航")
+            mobile_menu.click()
+            browser_api.expect(repository).to_have_attribute("href", repository_url)
+            browser_api.expect(teaching_links).to_have_count(0)
+            browser_api.expect(header.get_by_test_id("library-nav-mobile")).to_be_visible()
+            mobile_menu.click()
+            page.screenshot(path=str(artifacts / "web-mobile.png"), full_page=True)
+            page.set_viewport_size({"width": 1440, "height": 950})
+
+            first_id = page.evaluate("localStorage.getItem('harness.session')")
+            second_id = page.request.post(
+                f"http://127.0.0.1:{port}/api/agent/sessions",
+                headers={"X-Agent-Client": "web"},
+            ).json()["id"]
+            page.reload()
+            browser_api.expect(page.locator("#connection")).to_have_text("本地服务已连接")
+            held = []
+
+            def delay_send_response(route):
+                held.append((route, route.fetch()))
+
+            page.route(f"**/api/agent/sessions/{first_id}/messages", delay_send_response)
+            page.locator("#message").fill("延迟响应验证")
+            page.locator("#send").click()
+            page.locator(f'#sessions button[data-session-id="{second_id}"]').click()
+            browser_api.expect(page.locator("#message")).to_be_enabled()
+            page.locator("#message").fill("keep this draft")
+            assert held
+            held[0][0].fulfill(response=held[0][1])
+            browser_api.expect(page.locator("#message")).to_have_value("keep this draft")
+            page.request.post(
+                f"http://127.0.0.1:{port}/api/agent/sessions/{first_id}/cancel",
+                headers={"X-Agent-Client": "web"},
+            )
+            page.locator(f'#sessions button[data-session-id="{first_id}"]').click()
+            browser_api.expect(page.locator("#runtime-status")).to_have_text("准备就绪")
+
+            page.get_by_role("button", name="切换主题").click()
+            browser_api.expect(page.locator("html")).to_have_class("dark")
+            page.get_by_role("button", name="EN", exact=True).click()
+            browser_api.expect(page.locator("h1")).to_have_text("Agent Workbench")
+            browser_api.expect(page.get_by_test_id("skill-menu").locator("summary")).to_have_text(
+                "Skills"
+            )
+            browser_api.expect(page).to_have_title("AYANAMI")
+            browser_api.expect(page.locator(".message.assistant .body")).to_contain_text(
+                "browser-ready"
+            )
+
+            personalized = page.get_by_test_id("session-personalized")
+            temporary = page.get_by_test_id("session-temporary")
+            memory_hint = page.locator("#conversation-memory-hint")
+            page.get_by_role("button", name="Memory", exact=True).click()
+            memories = page.locator("#memories")
+            browser_api.expect(memories).to_contain_text("Browser test memory")
+            browser_api.expect(personalized).to_be_checked()
+            browser_api.expect(temporary).not_to_be_checked()
+            temporary.click()
+            browser_api.expect(temporary).to_be_checked()
+            browser_api.expect(memory_hint).to_contain_text("Writes are paused")
+            browser_api.expect(memories).to_contain_text("Browser test memory")
+            personalized.click()
+            browser_api.expect(personalized).not_to_be_checked()
+            browser_api.expect(memory_hint).to_contain_text(
+                "skips long-term memory reads and writes"
+            )
+            browser_api.expect(memories).to_have_text("No project memory yet")
+            page.reload()
+            browser_api.expect(page.locator("#connection")).to_have_text("Local service connected")
+            browser_api.expect(personalized).not_to_be_checked()
+            browser_api.expect(temporary).to_be_checked()
+
+            active = page.locator("#sessions")
+            archived = page.get_by_test_id("archived-conversations")
+            first_row = active.locator(f'[data-session-row="{first_id}"]')
+            second_row = active.locator(f'[data-session-row="{second_id}"]')
+            first_row.get_by_test_id("archive-conversation").click()
+            browser_api.expect(first_row).to_have_count(0)
+            browser_api.expect(second_row.locator("[data-session-id]")).to_have_attribute(
+                "aria-current", "page"
+            )
+            browser_api.expect(personalized).to_be_checked()
+            browser_api.expect(temporary).not_to_be_checked()
+
+            page.reload()
+            browser_api.expect(page.locator("#connection")).to_have_text("Local service connected")
+            archived.locator("summary").click()
+            archived_first = archived.locator(f'[data-session-row="{first_id}"]')
+            archived_first.get_by_test_id("restore-conversation").click()
+            browser_api.expect(archived_first).to_have_count(0)
+            browser_api.expect(page.locator(".message.assistant .body")).to_contain_text(
+                "browser-ready"
+            )
+            browser_api.expect(personalized).not_to_be_checked()
+            browser_api.expect(temporary).to_be_checked()
+
+            first_row.get_by_test_id("delete-conversation").click()
+            confirmation = page.get_by_test_id("delete-conversation-dialog")
+            browser_api.expect(confirmation).to_be_visible()
+            confirmation.get_by_role("button", name="Cancel", exact=True).click()
+            browser_api.expect(first_row).to_be_visible()
+            first_row.get_by_test_id("delete-conversation").click()
+            confirmation.get_by_test_id("confirm-delete-conversation").click()
+            browser_api.expect(confirmation).to_have_count(0)
+            browser_api.expect(first_row).to_have_count(0)
+            assert page.request.get(f"/api/agent/sessions/{first_id}").status == 404
+
+            second_row.get_by_test_id("archive-conversation").click()
+            browser_api.expect(second_row).to_have_count(0)
+            browser_api.expect(active.locator("[data-session-id]")).to_have_count(1)
+            browser_api.expect(page.locator("#message")).to_be_enabled()
+            browser_api.expect(personalized).to_be_checked()
+            browser_api.expect(temporary).not_to_be_checked()
+
+            archived_second = archived.locator(f'[data-session-row="{second_id}"]')
+            archived_second.get_by_test_id("delete-conversation").click()
+            confirmation.get_by_test_id("confirm-delete-conversation").click()
+            browser_api.expect(archived.get_by_test_id("archived-conversation-count")).to_have_text(
+                "0"
+            )
+            assert page.request.get(f"/api/agent/sessions/{second_id}").status == 404
+
+            # Split a RAG answer across the cursor. Older history must prepend
+            # without duplicating the assistant message or moving the viewport.
+            repo = app.state.application.repository
+            long_id = page.evaluate("localStorage.getItem('harness.session')")
+            for index in range(6):
+                repo.emit(long_id, "user", {"text": f"Older message {index}"})
+            repo.emit(long_id, "assistant", {"text": "Cited answer [S1]", "run_id": "boundary"})
+            repo.emit(long_id, "library_answer", {
+                "text": "Cited answer [S1]", "run_id": "boundary",
+                "citations": [{"id": "S1", "document_id": "d", "version_id": "v",
+                               "chunk_id": "c", "name": "Cited note", "text": "evidence",
+                               "location": {}}],
+            })
+            for index in range(HISTORY_PAGE_SIZE - 1):
+                repo.emit(long_id, "user", {"text": f"Recent message {index}"})
+            pending = []
+            remaining_url = f"**/sessions/{long_id}/history?part=remaining*"
+            page.route(remaining_url, lambda route: pending.append(route))
+            page.reload()
+            entries = page.locator("#messages .message")
+            browser_api.expect(entries).to_have_count(HISTORY_PAGE_SIZE - 1)
+            browser_api.expect(page.get_by_text("Cited answer [S1]", exact=True)).to_have_count(0)
+            assert len(pending) == 1
+            repo.emit(long_id, "assistant", {"text": "Assistant reply during initial history loading"})
+            pending[0].fulfill(response=pending[0].fetch())
+            page.unroute(remaining_url)
+            browser_api.expect(page.locator("#connection")).to_have_text("Local service connected")
+            browser_api.expect(entries).to_have_count(HISTORY_PAGE_SIZE + 1)
+            browser_api.expect(entries.first).to_contain_text("Cited answer [S1]")
+            browser_api.expect(entries.last).to_contain_text("Assistant reply during initial history loading")
+            browser_api.expect(page.get_by_text("Older message 0", exact=True)).to_have_count(0)
+            scroller = page.locator("#chat-scroll")
+            with page.expect_response(lambda response: f"/sessions/{long_id}/history?before=" in response.url):
+                anchor_top = scroller.evaluate("""el => {
+                    el.scrollTop = 0;
+                    return el.querySelector('[data-history-row]').getBoundingClientRect().top;
+                }""")
+            browser_api.expect(entries).to_have_count(HISTORY_PAGE_SIZE + 7)
+            cited = page.get_by_text("Cited answer [S1]", exact=True)
+            browser_api.expect(cited).to_have_count(1)
+            browser_api.expect(page.get_by_test_id("rag-source")).to_have_count(1)
+            browser_api.expect(page.get_by_test_id("load-older-history")).to_have_count(0)
+            assert abs(cited.evaluate("el => el.closest('[data-history-row]').getBoundingClientRect().top") - anchor_top) < 3
+            repo.emit(long_id, "user", {"text": "Live message during history review"})
+            browser_api.expect(entries.last).to_contain_text("Live message during history review")
+            assert abs(cited.evaluate("el => el.closest('[data-history-row]').getBoundingClientRect().top") - anchor_top) < 3
+            assert errors == []
+            browser.close()
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+        listener.close()

@@ -1,0 +1,30 @@
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+exporters:
+  jaeger_storage_exporter:
+    trace_storage: primary
+extensions:
+  jaeger_query:
+    storage:
+      traces: primary
+    http:
+      endpoint: 0.0.0.0:16686
+  jaeger_storage:
+    backends:
+      primary:
+        badger:
+          directories:
+            keys: /state/keys
+            values: /state/values
+          ephemeral: false
+          ttl:
+            spans: 72h
+service:
+  extensions: [jaeger_storage, jaeger_query]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [jaeger_storage_exporter]

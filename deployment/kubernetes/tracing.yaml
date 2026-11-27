@@ -1,0 +1,148 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+spec:
+  selector:
+    app: otel-collector
+  ports:
+    - name: otlp-http
+      port: 4318
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: collector
+          image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector:0.165.0
+          args: [--config=/etc/tracing/config.yaml]
+          ports:
+            - name: otlp-http
+              containerPort: 4318
+            - name: health
+              containerPort: 13133
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+          volumeMounts:
+            - name: config
+              mountPath: /etc/tracing
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jaeger-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+spec:
+  selector:
+    app: jaeger
+  ports:
+    - name: otlp-http
+      port: 4318
+    - name: query
+      port: 16686
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: jaeger
+          image: cr.jaegertracing.io/jaegertracing/jaeger:2.23.0
+          args: [--config=/etc/tracing/config.yaml]
+          env:
+            - name: OTEL_TRACES_SAMPLER
+              value: always_off
+          ports:
+            - name: otlp-http
+              containerPort: 4318
+            - name: query
+              containerPort: 16686
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            httpGet:
+              path: /
+              port: query
+          volumeMounts:
+            - name: config
+              mountPath: /etc/tracing
+              readOnly: true
+            - name: storage
+              mountPath: /state
+      volumes:
+        - name: config
+          configMap:
+            name: jaeger
+        - name: storage
+          persistentVolumeClaim:
+            claimName: jaeger-data
